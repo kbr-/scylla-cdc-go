@@ -6,11 +6,12 @@ import (
 	"log"
 	"os"
 	"os/signal"
-	"time"
 
 	"github.com/gocql/gocql"
 	scylla_cdc "github.com/piodul/scylla-cdc-go"
 )
+
+// TODO: Remove?
 
 func main() {
 	// This wrapper around HostSelectionPolicy is used in order to forward information about the cluster topology
@@ -29,19 +30,14 @@ func main() {
 
 	// Configuration for the CDC reader
 	cfg := &scylla_cdc.ReaderConfig{
-		Session:             session,
-		Consistency:         gocql.One,
-		Context:             context.Background(),
-		LogTableName:        "ks.tbl_scylla_cdc_log",
-		ChangeConsumer:      scylla_cdc.ChangeConsumerFunc(simpleConsumer),
-		ClusterStateTracker: tracker,
+		Session:               session,
+		Consistency:           gocql.One,
+		TableNames:            []string{"ks.tbl"},
+		ChangeConsumerFactory: scylla_cdc.MakeChangeConsumerFactoryFromFunc(simpleConsumer),
+		ClusterStateTracker:   tracker,
+		ProgressManager:       &scylla_cdc.NoProgressManager{},
 
-		// Those two are the main knobs that control library's polling strategy.
-		// Refer to the README for information on how to configure them.
-		//
-		// This configuration represents the first strategy (quick processing, with duplicates).
-		LowerBoundReadOffset: 3 * time.Second,
-		UpperBoundReadOffset: 0,
+		Logger: log.New(os.Stderr, "", log.Ldate|log.Lmicroseconds|log.Lshortfile),
 	}
 
 	reader, err := scylla_cdc.NewReader(cfg)
@@ -61,19 +57,12 @@ func main() {
 	}()
 	signal.Notify(signalC, os.Interrupt)
 
-	if err := reader.Run(); err != nil {
-		log.Fatal(err)
+	if err := reader.Run(context.Background()); err != nil {
+		log.Fatalf("replicator failed: %s", err)
 	}
 }
 
-func simpleConsumer(change scylla_cdc.Change) {
-	fmt.Printf("Current time is %v\n", time.Now())
-	fmt.Printf("Consuming change of type %d\n", change.GetOperation())
-	fmt.Printf("Time is %v\n", change.GetTime().Time())
-	fmt.Printf("TTL is %d\n", change.GetTTL())
-	fmt.Printf("Value of column \"pk\" is %v\n", change.GetValue("pk"))
-	fmt.Printf("Value of column \"c\" is %v\n", change.GetValue("c"))
-	fmt.Printf("Was \"c\" column deleted? %t\n", change.IsDeleted("c"))
-	fmt.Printf("Deleted elements of column \"c\": %v\n", change.GetDeletedElements("c"))
-	fmt.Println("")
+func simpleConsumer(tableName string, change scylla_cdc.Change) error {
+	fmt.Println(tableName, change)
+	return nil
 }

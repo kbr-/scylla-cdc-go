@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
-	"fmt"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -19,31 +18,77 @@ type ReaderConfig struct {
 	// An active gocql session to the cluster.
 	Session *gocql.Session
 
+	// Names of the tables for which to read changes. This should be the name
+	// of the base table, not the cdc log table.
+	// Can be prefixed with keyspace name.
+	TableNames []string
+
 	// Consistency to use when querying CDC log
 	Consistency gocql.Consistency
 
-	// Context can be used for early cancellation
-	Context context.Context
+	// Creates ChangeProcessors, which process information fetched from the CDC log.
+	// A callback which processes information fetched from the CDC log.
+	ChangeConsumerFactory ChangeConsumerFactory
 
-	// The name of the cdc log table name. Must have _scylla_cdc_log suffix.
-	// Can be prefixed with keyspace name.
-	LogTableName string
-
-	// Determines by how much to offset time lower bound of the query when reading from CDC log.
-	// For more information about this option, see README.
-	LowerBoundReadOffset time.Duration
-
-	// When polling from CDC log, only rows with timestamps lower than Now - UpperBoundReadOffset are requested.
-	// For more information about this option, see README.
-	UpperBoundReadOffset time.Duration
+	// An object which allows the reader to read and write information about
+	// current progress.
+	ProgressManager ProgressManager
 
 	// An object which tracks cluster metadata such as current tokens and node count.
 	// While this object is optional, it is highly recommended that this field points to a valid ClusterStateTracker.
 	// For usage, refer to the example application.
 	ClusterStateTracker *ClusterStateTracker
 
-	// A callback which processes information fetched from the CDC log.
-	ChangeConsumer ChangeConsumer
+	// A logger. If set, it will receive log messages useful for debugging of the library.
+	Logger Logger
+
+	// Advanced parameters
+	Advanced AdvancedReaderConfig
+}
+
+// TODO: Document
+type AdvancedReaderConfig struct {
+	ConfidenceWindowSize time.Duration
+
+	PostNonEmptyQueryDelay time.Duration
+	PostEmptyQueryDelay    time.Duration
+	PostFailedQueryDelay   time.Duration
+
+	QueryTimeWindowSize time.Duration
+	ChangeAgeLimit      time.Duration
+}
+
+// Creates a ReaderConfig struct with safe defaults.
+func NewReaderConfig(
+	session *gocql.Session,
+	consumerFactory ChangeConsumerFactory,
+	progressManager ProgressManager,
+	tableNames ...string,
+) *ReaderConfig {
+	return &ReaderConfig{
+		Session:               session,
+		TableNames:            tableNames,
+		Consistency:           gocql.Quorum,
+		ChangeConsumerFactory: consumerFactory,
+		ProgressManager:       progressManager,
+
+		Advanced: AdvancedReaderConfig{
+			ConfidenceWindowSize: 30 * time.Second,
+
+			PostNonEmptyQueryDelay: 10 * time.Second,
+			PostEmptyQueryDelay:    30 * time.Second,
+			PostFailedQueryDelay:   1 * time.Second,
+
+			QueryTimeWindowSize: 30 * time.Second,
+			ChangeAgeLimit:      1 * time.Minute, // TODO: Does that make sense?
+		},
+	}
+}
+
+func (rc *ReaderConfig) Copy() *ReaderConfig {
+	newRC := &ReaderConfig{}
+	*newRC = *rc
+	return newRC
 }
 
 var (
@@ -55,67 +100,200 @@ const (
 )
 
 type Reader struct {
-	config  *ReaderConfig
-	stopped int32
+	config     *ReaderConfig
+	genFetcher *generationFetcher
+	readFrom   time.Time
+	stoppedCh  chan struct{}
+	stopTime   atomic.Value
 }
 
 // Creates a new CDC reader.
 func NewReader(config *ReaderConfig) (*Reader, error) {
-	if config.Context == nil {
-		config.Context = context.Background()
+	if config.Logger == nil {
+		config.Logger = &noLogger{}
 	}
-	if !strings.HasSuffix(config.LogTableName, cdcTableSuffix) {
-		return nil, ErrNotALogTable
+
+	if config.ProgressManager == nil {
+		return nil, errors.New("no progress manager was specified")
+	}
+
+	readFrom, err := config.ProgressManager.GetCurrentGeneration()
+	if err != nil {
+		return nil, err
+	}
+	if readFrom.IsZero() {
+		readFrom = time.Now().Add(-config.Advanced.ChangeAgeLimit)
+		config.Logger.Printf("no saved progress found, will start reading from %v", readFrom)
+	} else {
+		config.Logger.Printf("last saved progress was at generation %v", readFrom)
+	}
+
+	genFetcher, err := newGenerationFetcher(
+		config.Session,
+		config.ClusterStateTracker,
+		readFrom,
+		config.Logger,
+	)
+	if err != nil {
+		return nil, err
 	}
 
 	reader := &Reader{
-		config:  &*config, // make a copy
-		stopped: 0,
+		config:     config.Copy(),
+		genFetcher: genFetcher,
+		readFrom:   readFrom,
+		stoppedCh:  make(chan struct{}),
 	}
 	return reader, nil
 }
 
 // Run runs the CDC reader. This call is blocking and returns after an error occurs, or the reader
 // is stopped gracefully.
-func (r *Reader) Run() error {
-	gen, err := r.findLatestGeneration()
-	if err != nil {
-		return err
-	}
+func (r *Reader) Run(ctx context.Context) error {
+	l := r.config.Logger
 
-	split, err := r.splitStreams(gen.streams)
-	if err != nil {
-		return err
-	}
+	runErrG, runCtx := errgroup.WithContext(ctx)
 
-	errG, ctx := errgroup.WithContext(r.config.Context)
-	for _, _group := range split {
-		group := _group
-		errG.Go(func() error {
-			return r.processStreamGroup(ctx, group)
-		})
-	}
+	runErrG.Go(func() error {
+		select {
+		case <-runCtx.Done():
+			return runCtx.Err()
+		case <-r.stoppedCh:
+		}
+		r.genFetcher.Stop()
+		return nil
+	})
+	runErrG.Go(func() error {
+		return r.genFetcher.Run(runCtx)
+	})
+	runErrG.Go(func() error {
+		gen, err := r.genFetcher.Get(runCtx)
+		if gen == nil {
+			return err
+		}
 
-	return errG.Wait()
+		if r.readFrom.Before(gen.startTime) {
+			r.readFrom = gen.startTime
+		}
+
+		for {
+			l.Printf("starting reading generation %v from timestamp %v", gen.startTime, r.readFrom)
+
+			if err := r.config.ProgressManager.StartGeneration(gen.startTime); err != nil {
+				return err
+			}
+
+			// Start batch readers for this generation
+			split, err := r.splitStreams(gen.streams)
+			if err != nil {
+				return err
+			}
+
+			l.Printf("grouped %d streams into %d batches", len(gen.streams), len(split))
+
+			genErrG, genCtx := errgroup.WithContext(runCtx)
+
+			readers := make([]*streamBatchReader, 0, len(split)*len(r.config.TableNames))
+			for _, tableName := range r.config.TableNames {
+				// TODO: This is ugly?
+				splitName := strings.SplitN(tableName, ".", 2)
+				for _, group := range split {
+					readers = append(readers, newStreamBatchReader(
+						r.config,
+						gen.startTime,
+						group,
+						splitName[0],
+						splitName[1],
+						gocql.MinTimeUUID(r.readFrom),
+					))
+				}
+			}
+
+			sleepAmount := r.config.Advanced.PostNonEmptyQueryDelay / time.Duration(len(readers))
+			for i := range readers {
+				reader := readers[i] // TODO: Should this be interruptible?
+				<-time.After(sleepAmount)
+				genErrG.Go(func() error {
+					return reader.run(genCtx)
+				})
+			}
+
+			var nextGen *generation
+			genErrG.Go(func() error {
+				var err error
+				nextGen, err = r.genFetcher.Get(genCtx)
+				if err != nil {
+					return err
+				}
+				for _, reader := range readers {
+					if nextGen == nil {
+						// The reader was stopped
+						stopAt, _ := r.stopTime.Load().(time.Time)
+						if stopAt.IsZero() {
+							reader.stopNow()
+						} else {
+							reader.close(gocql.MaxTimeUUID(stopAt))
+							r.readFrom = stopAt
+						}
+					} else {
+						reader.close(gocql.MinTimeUUID(nextGen.startTime))
+						r.readFrom = nextGen.startTime
+					}
+				}
+				return nil
+			})
+
+			if err := genErrG.Wait(); err != nil {
+				return err
+			}
+			l.Printf("stopped reading from generation %v", gen.startTime)
+			if nextGen == nil {
+				break
+			}
+			gen = nextGen
+
+			if err := r.config.ProgressManager.EndGeneration(gen.startTime); err != nil {
+				return err
+			}
+		}
+
+		return nil
+	})
+
+	return runErrG.Wait()
 }
 
-// Stop gracefully stops the CDC reader. It does not wait until the reader shuts down.
+// Stop tells the reader to stop as soon as possible. There is no guarantee
+// related to how much data will be processed in each stream when the reader
+// stops. If you want to e.g. make sure that all cdc log data with timestamps
+// up to the current moment was processed, use (*Reader).StopAt(time.Now()).
+// This function does not wait until the reader stops.
 func (r *Reader) Stop() {
-	atomic.StoreInt32(&r.stopped, 1)
+	close(r.stoppedCh)
 }
 
-func (r *Reader) splitStreams(streams []stream) (split [][]stream, err error) {
+// StopAt tells the reader to stop reading changes after reaching given timestamp.
+// Does not guarantee that the reader won't read any changes after the timestamp,
+// but the reader will stop after all tables and streams are advanced to or past
+// the timestamp.
+// This function does not wait until the reader stops.
+func (r *Reader) StopAt(at time.Time) {
+	r.stopTime.Store(at)
+	close(r.stoppedCh)
+}
+
+func (r *Reader) splitStreams(streams []StreamID) (split [][]StreamID, err error) {
 	if r.config.ClusterStateTracker == nil {
 		// This method of polling is quite bad for performance, but we cannot do better without the tracker
 		// TODO: Maybe forbid, or at least warn?
 		for _, s := range streams {
-			split = append(split, []stream{s})
+			split = append(split, []StreamID{s})
 		}
 		return
 	}
 
 	tokens := r.config.ClusterStateTracker.GetTokens()
-	vnodesToStreams := make(map[int64][]stream, 0)
+	vnodesToStreams := make(map[int64][]StreamID, 0)
 
 	for _, stream := range streams {
 		var streamInt int64
@@ -132,69 +310,9 @@ func (r *Reader) splitStreams(streams []stream) (split [][]stream, err error) {
 		vnodesToStreams[chosenTok] = append(vnodesToStreams[chosenTok], stream)
 	}
 
-	groups := make([][]stream, 0, len(vnodesToStreams))
+	groups := make([][]StreamID, 0, len(vnodesToStreams))
 	for _, streams := range vnodesToStreams {
 		groups = append(groups, streams)
 	}
 	return groups, nil
-}
-
-func (r *Reader) processStreamGroup(ctx context.Context, streams []stream) error {
-	if len(streams) == 0 {
-		return nil
-	}
-
-	lastTimestamp := gocql.MinTimeUUID(time.Now())
-
-	streamsWildcards := "?" + strings.Repeat(", ?", len(streams)-1)
-	queryString := fmt.Sprintf(
-		"SELECT * FROM %s WHERE \"cdc$stream_id\" IN (%s) AND \"cdc$time\" > ? AND \"cdc$time\" < ?",
-		r.config.LogTableName,
-		streamsWildcards,
-	)
-	query := r.config.Session.Query(queryString).Consistency(r.config.Consistency)
-
-	for {
-		if atomic.LoadInt32(&r.stopped) != 0 {
-			return nil
-		}
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-
-		readRangeStartTimestamp := lastTimestamp
-		if r.config.LowerBoundReadOffset != 0 {
-			readRangeStartTimestamp = gocql.MinTimeUUID(lastTimestamp.Time().Add(-r.config.LowerBoundReadOffset))
-		}
-
-		readRangeEndTimestamp := gocql.MaxTimeUUID(time.Now().Add(-r.config.UpperBoundReadOffset))
-
-		bindArgs := make([]interface{}, 0, len(streams)+2)
-		for _, stream := range streams {
-			bindArgs = append(bindArgs, stream)
-		}
-		bindArgs = append(bindArgs, readRangeStartTimestamp, readRangeEndTimestamp)
-
-		iter := query.Bind(bindArgs...).Iter()
-
-		for {
-			timestamp := &gocql.UUID{}
-			data := map[string]interface{}{
-				"cdc$time": timestamp,
-			}
-			if !iter.MapScan(data) {
-				break
-			}
-
-			r.config.ChangeConsumer.Consume(Change{data: data})
-
-			if bytes.Compare(lastTimestamp[:], timestamp[:]) < 0 {
-				lastTimestamp = *timestamp
-			}
-		}
-
-		if err := iter.Close(); err != nil {
-			return err
-		}
-	}
 }
